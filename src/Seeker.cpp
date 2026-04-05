@@ -223,6 +223,21 @@ Seeker::Seeker(
     // Outer half-weight LUT: 255 → 128, 0 → 0
     _outer_lut = cv::Mat(1, 256, CV_8U, cv::Scalar(0));
     _outer_lut.at<uchar>(0, 255) = 128;
+
+#ifdef DRONE_USE_CUDA
+    {
+        int n = cv::cuda::getCudaEnabledDeviceCount();
+        _use_gpu = (n > 0);
+        if (_use_gpu) {
+            printf("[Seeker] CUDA enabled (%d device(s)) — GPU acceleration active\n", n);
+            _gpu_outer_lut_d.upload(_outer_lut);
+            _gpu_morph_close = cv::cuda::createMorphologyFilter(
+                cv::MORPH_CLOSE, CV_8UC1, _kern3);
+            _gpu_gauss_bp = cv::cuda::createGaussianFilter(
+                CV_8UC1, CV_8UC1, cv::Size(3, 3), 0);
+        }
+    }
+#endif
 }
 
 // ── open / close ──────────────────────────────────────────────────────────────
@@ -423,11 +438,47 @@ cv::Mat Seeker::_pinkMask(const cv::Mat& hsv)
     return mask;
 }
 
+#ifdef DRONE_USE_CUDA
+// GPU version of _maskInrange + morphologyEx CLOSE.
+// Reads _gpu_hsv_d (must be uploaded before calling).
+cv::Mat Seeker::_maskInrangeGpu()
+{
+    // Apply an inRange band on the GPU, writing to `out`.
+    auto gpu_band = [&](const Band& b, cv::cuda::GpuMat& out) {
+        if (b.mode == Band::SINGLE) {
+            cv::cuda::inRange(_gpu_hsv_d, b.lo_a, b.hi_a, out);
+        } else {
+            cv::cuda::inRange(_gpu_hsv_d, b.lo_a, b.hi_a, _gpu_tmp_a);
+            cv::cuda::inRange(_gpu_hsv_d, b.lo_b, b.hi_b, _gpu_tmp_b);
+            cv::cuda::bitwise_or(_gpu_tmp_a, _gpu_tmp_b, out);
+        }
+    };
+
+    cv::cuda::GpuMat gpu_core, gpu_outer;
+    gpu_band(_band_core,  gpu_core);
+    gpu_band(_band_outer, gpu_outer);
+
+    // outer-only pixels → scale to 128 via LUT, then OR with core (255)
+    cv::cuda::subtract(gpu_outer, gpu_core, _gpu_tmp_a);
+    cv::cuda::LUT(_gpu_tmp_a, _gpu_outer_lut_d, _gpu_tmp_b);
+    cv::cuda::bitwise_or(gpu_core, _gpu_tmp_b, _gpu_tmp_a);
+
+    _gpu_morph_close->apply(_gpu_tmp_a, _gpu_tmp_a);
+
+    cv::Mat result;
+    _gpu_tmp_a.download(result);
+    return result;
+}
+#endif
+
 cv::Mat Seeker::_detectionMask(const cv::Mat& hsv, bool locked)
 {
     if (!_has_cal) return _pinkMask(hsv);
 
     if (locked) {
+#ifdef DRONE_USE_CUDA
+        if (_use_gpu) return _maskInrangeGpu();
+#endif
         cv::Mat m = _maskInrange(hsv);
         cv::morphologyEx(m, m, cv::MORPH_CLOSE, _kern3);
         return m;
@@ -556,6 +607,13 @@ std::pair<int,int> Seeker::track(cv::Mat& frame)
     if (_hsv_buf.empty() || _hsv_buf.size() != frame.size())
         _hsv_buf = cv::Mat(frame.size(), CV_8UC3);
 
+#ifdef DRONE_USE_CUDA
+    if (_use_gpu) {
+        _gpu_src.upload(frame);
+        cv::cuda::cvtColor(_gpu_src, _gpu_hsv_d, cv::COLOR_BGR2HSV);
+        _gpu_hsv_d.download(_hsv_buf);
+    } else
+#endif
     cv::cvtColor(frame, _hsv_buf, cv::COLOR_BGR2HSV);
     const cv::Mat& hsv = _hsv_buf;
 
@@ -678,7 +736,14 @@ std::pair<int,int> Seeker::track(cv::Mat& frame)
     if (bx1 > 0)         back_proj.colRange(0, bx1).setTo(0);
     if (bx2 < w_frame)   back_proj.colRange(bx2, w_frame).setTo(0);
 
-    cv::GaussianBlur(back_proj, back_proj, cv::Size(3,3), 0);
+#ifdef DRONE_USE_CUDA
+    if (_use_gpu) {
+        _gpu_bp_d.upload(back_proj);
+        _gpu_gauss_bp->apply(_gpu_bp_d, _gpu_bp_d);
+        _gpu_bp_d.download(back_proj);
+    } else
+#endif
+    cv::GaussianBlur(back_proj, back_proj, cv::Size(3, 3), 0);
 
     cv::RotatedRect ret;
     ret = cv::CamShift(back_proj, _track_win, _term_crit);

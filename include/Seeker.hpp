@@ -7,6 +7,12 @@
 #include <optional>
 #include <tuple>
 
+#ifdef DRONE_USE_CUDA
+#include <opencv2/cudaimgproc.hpp>
+#include <opencv2/cudafilters.hpp>
+#include <opencv2/cudaarithm.hpp>
+#endif
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 inline constexpr float  PINK_H_LO        = 130.f;
 inline constexpr float  PINK_H_HI        = 173.f;
@@ -121,6 +127,12 @@ private:
     // Precompute inRange bounds from gaussian parameters
     void _precomputeBands();
 
+#ifdef DRONE_USE_CUDA
+    // GPU-accelerated version of _maskInrange + morphologyEx close.
+    // Reads _gpu_hsv_d (populated by track()). Returns a CPU mask.
+    cv::Mat _maskInrangeGpu();
+#endif
+
     // Optionally show/update the calibration histogram window
     void _updateHistogramWindow();
 
@@ -170,6 +182,20 @@ private:
 
     // Morphological kernels
     cv::Mat _kern3;
+
+    bool _use_gpu = false;  // true when CUDA device found at runtime
+
+#ifdef DRONE_USE_CUDA
+    // Persistent GPU buffers — allocated once, reused each frame
+    cv::cuda::GpuMat          _gpu_src;           // BGR frame upload
+    cv::cuda::GpuMat          _gpu_hsv_d;         // HSV on GPU
+    cv::cuda::GpuMat          _gpu_tmp_a;         // scratch A
+    cv::cuda::GpuMat          _gpu_tmp_b;         // scratch B
+    cv::cuda::GpuMat          _gpu_bp_d;          // back-projection on GPU
+    cv::cuda::GpuMat          _gpu_outer_lut_d;   // half-weight LUT on GPU
+    cv::Ptr<cv::cuda::Filter> _gpu_morph_close;   // MORPH_CLOSE CV_8UC1
+    cv::Ptr<cv::cuda::Filter> _gpu_gauss_bp;      // 3×3 Gaussian for back-proj
+#endif
 
     // H-channel copy buffer for Gaussian back-projection
     cv::Mat _h_buf;

@@ -10,6 +10,7 @@ C++ rewrite of the drone-seeker pink-object visual tracking pipeline.
 | C++ compiler | C++17 | GCC 8+, Clang 7+, MSVC 2017+ |
 | OpenCV | 4.x | `opencv-dev` / `libopencv-dev` |
 | MAVLink C headers | v2 | `c_library_v2` — fetched below |
+| SDL2 | 2.x | **Optional** — required for `--joystick` |
 
 ### Install OpenCV
 
@@ -28,6 +29,103 @@ brew install opencv
 vcpkg install opencv4
 ```
 
+### Install SDL2 (required for `--joystick`)
+
+**Ubuntu / Debian**
+```bash
+sudo apt install libsdl2-dev
+```
+
+**macOS (Homebrew)**
+```bash
+brew install sdl2
+```
+
+**Windows (vcpkg)**
+```bash
+vcpkg install sdl2
+```
+
+SDL2 is auto-detected by CMake. If not found, joystick support is silently disabled and `--joystick` will print an error at runtime. Force-disable with `-DWITH_JOYSTICK=OFF`.
+
+---
+
+### GPU acceleration (optional)
+
+The tracker can offload the hot per-frame operations (colour-space conversion,
+inRange masking, morphology, back-projection blur) to a CUDA GPU via OpenCV's
+CUDA modules.  It is completely optional — the build falls back to CPU if CUDA is
+not available, and the feature is detected automatically at both compile time and
+run time.
+
+**Requirements**
+
+| Requirement | Notes |
+|---|---|
+| NVIDIA GPU | Kepler (GTX 600) or newer |
+| CUDA Toolkit | 11.x or 12.x — must match the OpenCV CUDA build |
+| OpenCV built with CUDA | The default `apt`/`brew` packages are CPU-only; see below |
+
+**Build OpenCV with CUDA (Ubuntu)**
+
+```bash
+# Install CUDA Toolkit from https://developer.nvidia.com/cuda-downloads first
+sudo apt install -y cmake g++ libgtk-3-dev libavcodec-dev libavformat-dev \
+    libswscale-dev libv4l-dev
+
+git clone --depth=1 https://github.com/opencv/opencv.git
+git clone --depth=1 https://github.com/opencv/opencv_contrib.git
+
+# Adjust CUDA_ARCH_BIN to your GPU's compute capability (see note below)
+cmake -B opencv/build opencv \
+    -DOPENCV_EXTRA_MODULES_PATH=opencv_contrib/modules \
+    -DWITH_CUDA=ON \
+    -DCUDA_ARCH_BIN="6.1;7.5;8.6;8.9" \
+    -DBUILD_opencv_cudaimgproc=ON \
+    -DBUILD_opencv_cudafilters=ON \
+    -DBUILD_opencv_cudaarithm=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr/local
+
+cmake --build opencv/build -j$(nproc)
+sudo cmake --install opencv/build
+```
+
+> Find your GPU's compute capability at <https://developer.nvidia.com/cuda-gpus>.
+> Common values: GTX 10xx → `6.1`, RTX 20xx → `7.5`, RTX 30xx → `8.6`,
+> RTX 40xx → `8.9`, Jetson Orin → `8.7`.
+
+**Build drone_seeker with GPU**
+
+CMake detects the CUDA build automatically via `OpenCV_CUDA_VERSION`:
+
+```bash
+cmake -B build -DOpenCV_DIR=/usr/local/lib/cmake/opencv4
+cmake --build build -j$(nproc)
+# Build output will show:
+#   [drone_seeker] OpenCV CUDA 12.x found — GPU path ON
+```
+
+To force CPU-only even when CUDA OpenCV is present:
+
+```bash
+cmake -B build -DOpenCV_DIR=... -DWITH_GPU=OFF
+cmake --build build -j$(nproc)
+```
+
+**Verify GPU is active at run time**
+
+When a CUDA device is found, the tracker prints on startup:
+
+```
+[Seeker] CUDA enabled (1 device(s)) — GPU acceleration active
+```
+
+If no CUDA device is found (or the binary was built with `-DWITH_GPU=OFF`), the
+CPU path is used silently.
+
+---
+
 ### Fetch MAVLink headers
 
 The project expects the `mavlink/c_library_v2` header-only library inside `mavlink/`.
@@ -44,7 +142,7 @@ git clone --depth=1 https://github.com/mavlink/c_library_v2.git mavlink
 
 ```bash
 # From the drone-seeker-cpp directory
-cmake -B build
+cmake -B build -DOpenCV_DIR=/usr/local/opt/opencv/lib/cmake/opencv4
 cmake --build build -j$(nproc)   # Linux/macOS
 cmake --build build              # Windows
 ```
@@ -110,6 +208,7 @@ Run `calibrate_color` with your camera pointed at the target:
 | `--debug` | off | Log telemetry to `tracking.csv` during TRACKING mode |
 | `--record` | off | Record annotated video to `tracking_<timestamp>.avi` |
 | `--auto` | off | Auto mode: enter TRACKING when within 700 m of target on final WP |
+| `--joystick [N]` | off | Enable joystick RC override; N = SDL2 device index (default 0) |
 
 ### Connection strings
 
@@ -142,6 +241,29 @@ Run `calibrate_color` with your camera pointed at the target:
   --crop 320 180 640 360 \
   --debug
 ```
+
+**Joystick RC override (device 0)**
+```bash
+./build/drone_seeker --connection udp:127.0.0.1:14550 --source 0 --joystick
+```
+
+**Joystick with explicit device index**
+```bash
+./build/drone_seeker --connection /dev/ttyUSB0 --baud 115200 --source 0 --joystick 1
+```
+
+> The joystick sends `RC_CHANNELS_OVERRIDE` to ArduPlane every frame.
+> CH6 (trigger / button 4-5) acts as the tracking arm switch, identical to a
+> hardware RC transmitter.  Channel mapping:
+>
+> | SDL axis / button | RC channel | Function |
+> |---|---|---|
+> | Axis 0 | CH1 | Aileron |
+> | Axis 1 (inverted) | CH2 | Elevator |
+> | Axis 2 | CH3 | Throttle |
+> | Axis 3 | CH4 | Rudder |
+> | Button 6 or 7 | CH5 | Flight mode switch |
+> | Button 4/5 or trigger axis 4/5 | CH6 | Arm / tracking enable |
 
 **Auto mission mode with video recording**
 ```bash

@@ -7,6 +7,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(OpenCV REQUIRED)
 find_package(Threads REQUIRED)
 
+# Optional joystick support via SDL2 (auto-detected; disable with -DWITH_JOYSTICK=OFF)
+option(WITH_JOYSTICK "Enable joystick RC override via SDL2" ON)
+if(WITH_JOYSTICK)
+    find_package(SDL2 QUIET)
+    if(SDL2_FOUND)
+        message(STATUS "[drone_seeker] SDL2 ${SDL2_VERSION} found — joystick support ON")
+    else()
+        message(STATUS "[drone_seeker] SDL2 not found — joystick support OFF (install libsdl2-dev)")
+        set(WITH_JOYSTICK OFF)
+    endif()
+endif()
+
 # MAVLink C headers (ardupilotmega dialect)
 # Fetch with: git clone --depth=1 https://github.com/mavlink/c_library_v2.git mavlink
 if(NOT DEFINED MAVLINK_INCLUDE_DIR)
@@ -20,6 +32,7 @@ add_executable(drone_seeker
     src/SeekerCtrl.cpp
     src/HudDisplay.cpp
     src/MavlinkConn.cpp
+    src/JoystickHandler.cpp
 )
 
 target_include_directories(drone_seeker PRIVATE
@@ -32,6 +45,21 @@ target_link_libraries(drone_seeker PRIVATE
     ${OpenCV_LIBS}
     Threads::Threads
 )
+
+# Optional GPU acceleration via OpenCV CUDA (auto-detected; disable with -DWITH_GPU=OFF)
+option(WITH_GPU "Enable GPU acceleration via OpenCV CUDA" ON)
+if(WITH_JOYSTICK AND SDL2_FOUND)
+    target_compile_definitions(drone_seeker PRIVATE DRONE_USE_JOYSTICK)
+    target_include_directories(drone_seeker PRIVATE ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(drone_seeker PRIVATE ${SDL2_LIBRARIES})
+endif()
+
+if(WITH_GPU AND OpenCV_CUDA_VERSION)
+    message(STATUS "[drone_seeker] OpenCV CUDA ${OpenCV_CUDA_VERSION} found — GPU path ON")
+    target_compile_definitions(drone_seeker PRIVATE DRONE_USE_CUDA)
+else()
+    message(STATUS "[drone_seeker] OpenCV CUDA not available — CPU-only build")
+endif()
 
 if(UNIX AND NOT APPLE)
     target_link_libraries(drone_seeker PRIVATE rt)

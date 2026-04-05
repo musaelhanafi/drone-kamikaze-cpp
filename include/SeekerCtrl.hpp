@@ -2,6 +2,7 @@
 #include "MavlinkConn.hpp"
 #include "Seeker.hpp"
 #include "HudDisplay.hpp"
+#include "JoystickHandler.hpp"
 
 #include <string>
 #include <memory>
@@ -58,6 +59,9 @@ struct SeekerCtrlConfig {
     bool        hud_pitch         = true;
     bool        hud_yaw           = true;
     bool        auto_mode         = false;
+
+    bool        use_joystick      = false;
+    int         joy_index         = 0;
 };
 
 class SeekerCtrl {
@@ -97,6 +101,9 @@ private:
     void _closeVideo();
     void _writeFrame(const cv::Mat& frame);
 
+    // ── RC override (joystick → autopilot) ───────────────────────────────────
+    void _sendRcOverride(const JoyChannels& ch);
+
     // ── Mode names ────────────────────────────────────────────────────────────
     static std::string _modeName(int custom_mode);
 
@@ -107,8 +114,9 @@ private:
     std::unique_ptr<MavlinkConn> _mav;
 
     // ── Seeker ───────────────────────────────────────────────────────────────
-    std::unique_ptr<Seeker>      _seeker;
-    std::unique_ptr<HudDisplay>  _hud;
+    std::unique_ptr<Seeker>          _seeker;
+    std::unique_ptr<HudDisplay>      _hud;
+    std::unique_ptr<JoystickHandler> _joy;
 
     // ── RC / mode state ───────────────────────────────────────────────────────
     int    _rc_ch6_pwm       = 0;

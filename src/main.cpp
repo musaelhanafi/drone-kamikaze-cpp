@@ -29,6 +29,7 @@ static void usage(const char* prog)
         "  --debug              Log telemetry to tracking.csv during TRACKING\n"
         "  --record             Record annotated video during TRACKING\n"
         "  --auto               Auto mode: enter TRACKING near target on final WP\n"
+        "  --joystick [N]       Enable joystick RC override; N = device index (default 0)\n"
         "  --help               Show this help\n",
         prog);
 }
@@ -90,6 +91,14 @@ int main(int argc, char* argv[])
             cfg.record = true;
         } else if (std::strcmp(a, "--auto") == 0) {
             cfg.auto_mode = true;
+        } else if (std::strcmp(a, "--joystick") == 0) {
+            cfg.use_joystick = true;
+            // Optional numeric argument: --joystick [N]
+            if (i+1 < argc) {
+                char* end;
+                long idx = std::strtol(argv[i+1], &end, 10);
+                if (*end == '\0') { cfg.joy_index = (int)idx; i++; }
+            }
         } else {
             printf("Unknown option: %s\n", a);
             usage(argv[0]);

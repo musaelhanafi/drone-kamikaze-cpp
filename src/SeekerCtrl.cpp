@@ -74,6 +74,9 @@ SeekerCtrl::SeekerCtrl(const SeekerCtrlConfig& cfg)
     );
 
     _hud = std::make_unique<HudDisplay>(0, 120, cfg.hud_pitch, cfg.hud_yaw);
+
+    if (cfg.use_joystick)
+        _joy = std::make_unique<JoystickHandler>(cfg.joy_index);
 }
 
 // ── connect ───────────────────────────────────────────────────────────────────
@@ -444,10 +447,28 @@ void SeekerCtrl::_writeFrame(const cv::Mat& frame)
     if (_vwriter_open) _vwriter.write(frame);
 }
 
+// ── RC override ───────────────────────────────────────────────────────────────
+
+void SeekerCtrl::_sendRcOverride(const JoyChannels& ch)
+{
+    mavlink_message_t msg;
+    // RC_CHANNELS_OVERRIDE (id 70): channels set to 0 = "don't override"
+    mavlink_msg_rc_channels_override_pack(
+        _mav->src_system, _mav->src_component, &msg,
+        _mav->target_system, _mav->target_component,
+        (uint16_t)ch.ch1, (uint16_t)ch.ch2,
+        (uint16_t)ch.ch3, (uint16_t)ch.ch4,
+        (uint16_t)ch.ch5, (uint16_t)ch.ch6,
+        0, 0,              // ch7, ch8 — not overridden
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0);  // ch9-ch18
+    _mav->send_message(msg);
+}
+
 // ── run ───────────────────────────────────────────────────────────────────────
 
 void SeekerCtrl::run()
 {
+    if (_joy) _joy->open();
     _seeker->open();
 
     std::deque<double> frame_times;
@@ -476,10 +497,18 @@ void SeekerCtrl::run()
         if (target_locked)
             std::tie(errorx, errory) = _seeker->errorXY(cx, cy, frame.cols, frame.rows);
 
-        // ── 3. Poll MAVLink ───────────────────────────────────────────────────
+        // ── 3. Poll MAVLink & joystick ────────────────────────────────────────
         _pollRC();
         _pollHeartbeat();
         _pollMavlinkState();
+
+        if (_joy) {
+            JoyChannels jch = _joy->read();
+            _sendRcOverride(jch);
+            // Let joystick CH6 drive the mode switch logic
+            _rc_ch6_pwm = jch.ch6;
+        }
+
         bool ch6_on  = _ch6Active();
         bool ch6_fell = _prev_ch6_on && !ch6_on;
 
@@ -616,4 +645,5 @@ void SeekerCtrl::run()
     _closeCsv();
     _closeVideo();
     _seeker->close();
+    if (_joy) _joy->close();
 }
