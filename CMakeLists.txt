@@ -61,6 +61,19 @@ else()
     message(STATUS "[drone_seeker] OpenCV CUDA not available — CPU-only build")
 endif()
 
+# Optional appearance trackers via opencv_tracking (disable with -DWITH_TRACKING=OFF)
+option(WITH_TRACKING "Enable appearance trackers: mil, csrt, dasiamrpn, nano, vit (requires opencv_tracking)" ON)
+if(WITH_TRACKING)
+    find_package(OpenCV COMPONENTS tracking QUIET)
+    if(OpenCV_tracking_FOUND)
+        message(STATUS "[drone_seeker] opencv_tracking found — appearance trackers ON")
+        target_compile_definitions(drone_seeker PRIVATE DRONE_USE_TRACKING)
+        target_link_libraries(drone_seeker PRIVATE opencv_tracking)
+    else()
+        message(STATUS "[drone_seeker] opencv_tracking not found — appearance trackers OFF (install opencv_contrib)")
+    endif()
+endif()
+
 if(UNIX AND NOT APPLE)
     target_link_libraries(drone_seeker PRIVATE rt)
 endif()
@@ -76,3 +89,34 @@ target_include_directories(calibrate_color PRIVATE
 target_link_libraries(calibrate_color PRIVATE
     ${OpenCV_LIBS}
 )
+
+# Camera recording test (standalone)
+add_executable(test_record_camera
+    src/test_record_camera.cpp
+)
+target_include_directories(test_record_camera PRIVATE
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(test_record_camera PRIVATE
+    ${OpenCV_LIBS}
+)
+
+# Joystick ch6 toggle test (requires SDL2)
+if(WITH_JOYSTICK AND SDL2_FOUND)
+    add_executable(test_joystick
+        src/test_joystick.cpp
+        src/MavlinkConn.cpp
+    )
+    target_include_directories(test_joystick PRIVATE
+        include
+        ${MAVLINK_INCLUDE_DIR}
+        ${SDL2_INCLUDE_DIRS}
+    )
+    target_link_libraries(test_joystick PRIVATE
+        ${SDL2_LIBRARIES}
+        Threads::Threads
+    )
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(test_joystick PRIVATE rt)
+    endif()
+endif()

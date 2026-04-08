@@ -11,8 +11,11 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
+#include <queue>
 
 // ── Tracking control tuning ───────────────────────────────────────────────────
+inline constexpr double TRK_CLOSE_M        = 1000.0; // enter TRACKING only within this slant distance (m)
 inline constexpr double LATENCY_S          = 0.08;   // pipeline latency to compensate (s)
 inline constexpr double PN_LEAD_S          = 0.30;   // proportional navigation lead (s)
 inline constexpr double TRK_MAX_DEG        = 30.0;   // must match ArduPlane TRK_MAX_DEG
@@ -55,7 +58,10 @@ struct SeekerCtrlConfig {
     bool        input_prediction  = true;
     std::string mask_algo         = "all";
     bool        use_camshift      = true;
+    std::string shift_algo        = "camshift";   // "camshift"|"meanshift"
     bool        box_filter        = true;
+    bool        use_kalman        = true;
+    std::string tracker;                    // ""|"mil"|"csrt"|"dasiamrpn"|"nano"|"vit"
     bool        hud_pitch         = true;
     bool        hud_yaw           = true;
     bool        auto_mode         = false;
@@ -103,6 +109,7 @@ private:
 
     // ── RC override (joystick → autopilot) ───────────────────────────────────
     void _sendRcOverride(const JoyChannels& ch);
+    void _releaseRcOverride();  // send 0 on all channels (release override)
 
     // ── Mode names ────────────────────────────────────────────────────────────
     static std::string _modeName(int custom_mode);
@@ -124,7 +131,6 @@ private:
     std::string _flight_mode = "?";
     int    _commanded_mode   = -1;
     bool   _prev_ch6_on      = false;
-    int    _tracking_entry_count = 0;
     int    _lost_count           = 0;
 
     // ── MAVLink telemetry state ───────────────────────────────────────────────
@@ -169,4 +175,15 @@ private:
     std::ofstream         _csv_file;
     cv::VideoWriter       _vwriter;
     bool                  _vwriter_open = false;
+
+    // Background writer thread — opens, encodes, and closes entirely off the main loop
+    std::thread                _vwriter_thread;
+    std::mutex                 _vwriter_mtx;
+    std::condition_variable    _vwriter_cv;
+    std::queue<cv::Mat>        _vwriter_queue;
+    bool                       _vwriter_stop  = false;
+    std::string                _vwriter_path;   // set before thread starts
+    int                        _vwriter_w = 0, _vwriter_h = 0;
+    double                     _measured_fps = 25.0;  // actual camera FPS from warmup
+    void                       _writerLoop();
 };

@@ -70,7 +70,10 @@ SeekerCtrl::SeekerCtrl(const SeekerCtrlConfig& cfg)
         cfg.show_mask,
         cfg.mask_algo,
         cfg.use_camshift,
-        cfg.box_filter
+        cfg.box_filter,
+        cfg.shift_algo,
+        cfg.use_kalman,
+        cfg.tracker
     );
 
     _hud = std::make_unique<HudDisplay>(0, 120, cfg.hud_pitch, cfg.hud_yaw);
@@ -343,11 +346,9 @@ void SeekerCtrl::_sendTracking(double errorx, double errory)
 {
     mavlink_message_t msg;
     uint64_t time_usec = (uint64_t)(mono_s() * 1e6);
-    char name[10] = "tracking\0";
-    mavlink_msg_debug_vect_pack(
+    mavlink_msg_tracking_message_pack(
         _mav->src_system, _mav->src_component, &msg,
-        name, time_usec,
-        (float)errorx, (float)errory, 0.0f);
+        time_usec, (float)errorx, (float)errory);
     _mav->send_message(msg);
 }
 
@@ -421,30 +422,79 @@ void SeekerCtrl::_logRow(double ts, double errorx, double errory,
 
 // ── Video recorder ────────────────────────────────────────────────────────────
 
+void SeekerCtrl::_writerLoop()
+{
+    // Open, encode, and close entirely within this thread
+    cv::VideoWriter vw;
+    vw.open(_vwriter_path, cv::VideoWriter::fourcc('m','p','4','v'),
+            _measured_fps, {_vwriter_w, _vwriter_h});
+    if (!vw.isOpened()) {
+        printf("[REC] Failed to open video writer in thread\n");
+        return;
+    }
+    printf("[REC] recording → %s\n", _vwriter_path.c_str());
+
+    while (true) {
+        cv::Mat frame;
+        {
+            std::unique_lock<std::mutex> lk(_vwriter_mtx);
+            _vwriter_cv.wait(lk, [this]{
+                return !_vwriter_queue.empty() || _vwriter_stop;
+            });
+            if (_vwriter_stop && _vwriter_queue.empty()) break;
+            frame = std::move(_vwriter_queue.front());
+            _vwriter_queue.pop();
+        }
+        vw.write(frame);
+    }
+
+    vw.release();
+    printf("[REC] recording stopped\n");
+}
+
 void SeekerCtrl::_openVideo(int w, int h)
 {
+    // Join any previous writer thread before starting a new one.
+    // It was signalled to stop by the preceding _closeVideo() and has been
+    // running in the background since then; by the time a new recording
+    // starts it is almost certainly already done.
+    if (_vwriter_thread.joinable()) _vwriter_thread.join();
+
     auto now = std::time(nullptr);
     char ts[32];
     std::strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", std::localtime(&now));
-    std::string path = std::string("tracking_") + ts + ".avi";
-    _vwriter.open(path, cv::VideoWriter::fourcc('M','J','P','G'), 25.0, {w, h});
-    _vwriter_open = _vwriter.isOpened();
-    if (_vwriter_open) printf("[REC] recording → %s\n", path.c_str());
-    else printf("[REC] Failed to open video writer\n");
+    _vwriter_path  = std::string("tracking_") + ts + ".mp4";
+    _vwriter_w     = w;
+    _vwriter_h     = h;
+    _vwriter_stop  = false;
+    _vwriter_open  = true;
+    _vwriter_thread = std::thread(&SeekerCtrl::_writerLoop, this);
 }
 
 void SeekerCtrl::_closeVideo()
 {
-    if (_vwriter_open) {
-        _vwriter.release();
-        _vwriter_open = false;
-        printf("[REC] recording stopped\n");
+    if (!_vwriter_open) return;
+    _vwriter_open = false;
+    {
+        std::lock_guard<std::mutex> lk(_vwriter_mtx);
+        _vwriter_stop = true;
     }
+    _vwriter_cv.notify_all();
+    // Do NOT join here — the writer thread finalises the file in the
+    // background so the main loop is never blocked.  The thread is joined
+    // by the next _openVideo() call or at the end of run().
 }
 
 void SeekerCtrl::_writeFrame(const cv::Mat& frame)
 {
-    if (_vwriter_open) _vwriter.write(frame);
+    if (!_vwriter_open) return;
+    cv::Mat copy = frame.clone();   // clone outside the lock
+    {
+        std::lock_guard<std::mutex> lk(_vwriter_mtx);
+        if (_vwriter_queue.size() < 4)
+            _vwriter_queue.push(std::move(copy));
+    }
+    _vwriter_cv.notify_one();
 }
 
 // ── RC override ───────────────────────────────────────────────────────────────
@@ -452,16 +502,32 @@ void SeekerCtrl::_writeFrame(const cv::Mat& frame)
 void SeekerCtrl::_sendRcOverride(const JoyChannels& ch)
 {
     mavlink_message_t msg;
-    // RC_CHANNELS_OVERRIDE (id 70): channels set to 0 = "don't override"
+    // RC_CHANNELS_OVERRIDE (id 70):
+    //   0       = passthrough (don't change this channel)
+    //   65535   = UINT16_MAX = release override (restore RC input)
+    // ch7-ch18 always set to UINT16_MAX so the FC never acts on stale
+    // overrides from any previous source — matches Python behaviour.
+    constexpr uint16_t REL = 65535;
     mavlink_msg_rc_channels_override_pack(
         _mav->src_system, _mav->src_component, &msg,
         _mav->target_system, _mav->target_component,
         (uint16_t)ch.ch1, (uint16_t)ch.ch2,
         (uint16_t)ch.ch3, (uint16_t)ch.ch4,
         (uint16_t)ch.ch5, (uint16_t)ch.ch6,
-        0, 0,              // ch7, ch8 — not overridden
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0);  // ch9-ch18
+        REL, REL,              // ch7, ch8 — release
+        REL, REL, REL, REL, REL, REL, REL, REL, REL, REL);  // ch9-ch18 release
     _mav->send_message(msg);
+}
+
+void SeekerCtrl::_releaseRcOverride()
+{
+    // Send 0 for ch1-6 (release/passthrough) and UINT16_MAX for ch7-18.
+    // Called on joystick exit so the FC returns to direct RC input.
+    JoyChannels zeros;  // default-constructed: ch1-ch6 = 1500/1000
+    zeros.ch1 = 0; zeros.ch2 = 0; zeros.ch3 = 0;
+    zeros.ch4 = 0; zeros.ch5 = 0; zeros.ch6 = 0;
+    _sendRcOverride(zeros);
+    printf("[Joy] RC override released\n");
 }
 
 // ── run ───────────────────────────────────────────────────────────────────────
@@ -470,6 +536,24 @@ void SeekerCtrl::run()
 {
     if (_joy) _joy->open();
     _seeker->open();
+
+    // Measure actual camera FPS over a warmup period so the VideoWriter
+    // uses the real rate — avoids slow-motion playback when the camera
+    // delivers fewer frames than it nominally reports.
+    {
+        constexpr int    WARMUP_FRAMES = 30;
+        constexpr double WARMUP_MIN_S  = 1.0;
+        printf("[Ctrl] Measuring camera FPS (%d frames)...\n", WARMUP_FRAMES);
+        cv::Mat wf;
+        auto t0 = steady_clock::now();
+        for (int i = 0; i < WARMUP_FRAMES; ++i) {
+            _seeker->readFrame(wf);
+        }
+        double elapsed = duration<double>(steady_clock::now() - t0).count();
+        if (elapsed < WARMUP_MIN_S) elapsed = WARMUP_MIN_S;
+        _measured_fps = WARMUP_FRAMES / elapsed;
+        printf("[Ctrl] Measured FPS: %.2f\n", _measured_fps);
+    }
 
     std::deque<double> frame_times;
     double prev_time     = mono_s();
@@ -513,27 +597,28 @@ void SeekerCtrl::run()
         bool ch6_fell = _prev_ch6_on && !ch6_on;
 
         // ── 4. Mode management ────────────────────────────────────────────────
-        if (_cfg.auto_mode) {
-            double dist_to_target = _distToTargetM();
-            bool close_enough = dist_to_target < 700.0;
-            bool on_last_wp   = (_waypoint_count > 0 &&
-                                 _current_wp == _waypoint_count - 1);
+        // Pre-compute once; reused in mode logic and display annotation.
+        double dist_to_target_m = _distToTargetM();
 
-            if (ch6_fell) {
-                _in_tracking = false;
-                _setMode(STABILIZE_MODE);
-            } else if (ch6_on) {
-                if (close_enough && on_last_wp && target_locked && !_in_tracking) {
-                    _setMode(TRACKING_MODE);
-                    _in_tracking = true;
-                    _tracking_entry_count++;
-                } else if (!(close_enough && on_last_wp) && !_in_tracking) {
+        if (_cfg.auto_mode) {
+            // Rules 1 & 2: enter TRACKING at last WP when close enough,
+            // regardless of joystick / ch6 state.
+            bool on_last_wp   = (_waypoint_count > 0 &&
+                                  _current_wp == _waypoint_count - 1);
+            bool close_enough = (dist_to_target_m <= TRK_CLOSE_M);
+            if (on_last_wp && close_enough && target_locked && !_in_tracking) {
+                _setMode(TRACKING_MODE);
+                _in_tracking = true;
+            } else if (!_in_tracking) {
+                // Rule 1 (joystick on): ch6 high → AUTO, ch6 low → STABILIZE
+                // Rule 2 (joystick off): always AUTO, ch6 has no effect
+                if (_joy && !ch6_on)
+                    _setMode(STABILIZE_MODE);
+                else
                     _setMode(AUTO_MODE);
-                }
-            } else {
-                _setMode(STABILIZE_MODE);
             }
         } else {
+            // Rule 3: ch6 gates TRACKING; no auto-mode logic.
             if (ch6_fell) {
                 _in_tracking = false;
                 _setMode(AUTO_MODE);
@@ -541,7 +626,6 @@ void SeekerCtrl::run()
                 if (target_locked && !_in_tracking) {
                     _setMode(TRACKING_MODE);
                     _in_tracking = true;
-                    _tracking_entry_count++;
                 }
             }
         }
@@ -588,33 +672,30 @@ void SeekerCtrl::run()
                 _logRow(now, errorx, errory - offset_norm, true, in_terminal);
             } else {
                 _lost_count++;
-                bool committed = _tracking_entry_count >= 3;
-                int  limit     = committed ? 30 : 10;
-                if (_lost_count >= limit) {
+                if (_lost_count >= 50) {
                     _lost_count  = 0;
                     _in_tracking = false;
                     _setMode(AUTO_MODE);
-                } else if (committed) {
-                    _sendTracking(_last_errorx, _last_errory);
                 } else {
-                    _sendTracking(0.0, 0.0);
+                    _sendTracking(_last_errorx, _last_errory);
                 }
-                double lx = committed ? _last_errorx : 0.0;
-                double ly = committed ? _last_errory : 0.0;
-                _logRow(now, lx, ly, false, in_terminal);
+                _logRow(now, _last_errorx, _last_errory, false, in_terminal);
             }
         }
 
         // ── 7. Annotate display ───────────────────────────────────────────────
-        double dist_km   = _distToTargetM() / 1000.0;
+        double dist_km   = dist_to_target_m / 1000.0;
         double spd_kmh   = _airspeed_ms * 3.6;
         int    h_frame   = frame.rows;
+        // LOCK is ON whenever the system is in auto-mode (always seeking)
+        // or ch6 is manually armed — matches Python: auto_mode or ch6_on.
+        bool lock_active = _cfg.auto_mode || ch6_on;
 
         char status[256];
         std::snprintf(status, sizeof(status),
             "FPS:%.1f  LOCK:%s  ex=%+.3f ey=%+.3f",
             fps,
-            ch6_on ? "ON" : "OFF",
+            lock_active ? "ON" : "OFF",
             target_locked ? errorx : 0.0,
             target_locked ? errory : 0.0);
 
@@ -644,6 +725,11 @@ void SeekerCtrl::run()
 
     _closeCsv();
     _closeVideo();
+    // Program is exiting — wait for the writer thread to finish the file.
+    if (_vwriter_thread.joinable()) _vwriter_thread.join();
     _seeker->close();
-    if (_joy) _joy->close();
+    if (_joy) {
+        _releaseRcOverride();  // restore RC input before closing joystick
+        _joy->close();
+    }
 }

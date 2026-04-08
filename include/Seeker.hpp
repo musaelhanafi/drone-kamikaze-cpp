@@ -13,6 +13,10 @@
 #include <opencv2/cudaarithm.hpp>
 #endif
 
+#ifdef DRONE_USE_TRACKING
+#include <opencv2/tracking.hpp>
+#endif
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 inline constexpr float  PINK_H_LO        = 130.f;
 inline constexpr float  PINK_H_HI        = 173.f;
@@ -20,14 +24,14 @@ inline constexpr float  PINK_S_LO        = 40.f;
 inline constexpr float  PINK_V_LO        = 80.f;
 inline constexpr float  PINK_SV_HI       = 233.f;
 
-inline constexpr double MIN_BLOB_AREA    = 20.0;
+inline constexpr double MIN_BLOB_AREA    = 9.0;
 inline constexpr double CENTER_THRESHOLD = 0.1;
-inline constexpr double MIN_EXTENT       = 0.45;
-inline constexpr double MIN_SOLIDITY     = 0.60;
-inline constexpr int    MIN_DIM          = 4;
+inline constexpr double MIN_EXTENT       = 0.30;
+inline constexpr double MIN_SOLIDITY     = 0.45;
+inline constexpr int    MIN_DIM          = 3;
 inline constexpr double MAX_ASPECT       = 6.0;
 
-inline constexpr double GAUSS_SIGMA      = 3.0;
+inline constexpr double GAUSS_SIGMA      = 2.0;
 
 // Kalman tuning
 inline constexpr double KF_Q_POS  = 2.0;
@@ -80,7 +84,10 @@ public:
         bool        show_mask      = false,
         std::string mask_algo      = "all",  // "gaussian"|"adaptive"|"inrange"|"all"
         bool        use_camshift   = true,
-        bool        box_filter     = true
+        bool        box_filter     = true,
+        std::string shift_algo     = "camshift", // "camshift"|"meanshift"
+        bool        use_kalman     = true,
+        std::string tracker        = ""    // ""|"mil"|"csrt"|"dasiamrpn"|"nano"|"vit"
     );
 
     void open();
@@ -155,6 +162,9 @@ private:
     std::string _mask_algo;
     bool        _use_camshift;
     bool        _box_filter;
+    std::string _shift_algo;
+    bool        _use_kalman;
+    std::string _tracker_name;
 
     // ── Camera ───────────────────────────────────────────────────────────────
     cv::VideoCapture _cap;
@@ -167,7 +177,8 @@ private:
 
     // ── Calibration histogram ─────────────────────────────────────────────────
     cv::Mat  _cal_hist;             // 180×1 float32, or empty if not loaded
-    cv::Mat  _conf_hist;            // windowed confidence histogram
+    cv::Mat  _conf_hist;            // windowed confidence histogram (2σ — detection)
+    cv::Mat  _roi_hist;             // wider confidence histogram   (3σ — CamShift)
     double   _gauss_mean = -1.0;
     double   _gauss_std  = -1.0;
     cv::Mat  _hue_gate_lut;         // uint8 LUT: 255 inside σ band, 0 outside
@@ -182,8 +193,13 @@ private:
 
     // Morphological kernels
     cv::Mat _kern3;
+    cv::Mat _kern5;
 
     bool _use_gpu = false;  // true when CUDA device found at runtime
+
+#ifdef DRONE_USE_TRACKING
+    cv::Ptr<cv::Tracker> _tracker;
+#endif
 
 #ifdef DRONE_USE_CUDA
     // Persistent GPU buffers — allocated once, reused each frame
@@ -195,6 +211,7 @@ private:
     cv::cuda::GpuMat          _gpu_outer_lut_d;   // half-weight LUT on GPU
     cv::Ptr<cv::cuda::Filter> _gpu_morph_close;   // MORPH_CLOSE CV_8UC1
     cv::Ptr<cv::cuda::Filter> _gpu_gauss_bp;      // 3×3 Gaussian for back-proj
+    cv::Ptr<cv::cuda::Filter> _gpu_dilate_bp;     // kern5 DILATE for back-proj
 #endif
 
     // H-channel copy buffer for Gaussian back-projection

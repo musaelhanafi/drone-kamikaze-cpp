@@ -9,6 +9,16 @@
 
 using namespace std::chrono;
 
+// ── Appearance tracker factory ────────────────────────────────────────────────
+#ifdef DRONE_USE_TRACKING
+static cv::Ptr<cv::Tracker> _makeTracker(const std::string& name)
+{
+    if (name == "mil") return cv::TrackerMIL::create();
+    throw std::invalid_argument(
+        "[Seeker] Unknown tracker '" + name + "'. Only 'mil' is supported.");
+}
+#endif
+
 // ── Monotonic clock helper ────────────────────────────────────────────────────
 static double mono_s()
 {
@@ -165,7 +175,10 @@ Seeker::Seeker(
     bool        show_mask,
     std::string mask_algo,
     bool        use_camshift,
-    bool        box_filter)
+    bool        box_filter,
+    std::string shift_algo,
+    bool        use_kalman,
+    std::string tracker)
     : _source_index   (source_index)
     , _source_file    (source_file)
     , _window_name    (window_name)
@@ -177,7 +190,10 @@ Seeker::Seeker(
     , _show_mask      (show_mask)
     , _mask_algo      (mask_algo)
     , _use_camshift   (use_camshift)
+    , _shift_algo     (std::move(shift_algo))
     , _box_filter     (box_filter)
+    , _use_kalman     (use_kalman)
+    , _tracker_name   (std::move(tracker))
     , _term_crit      (cv::TermCriteria::EPS | cv::TermCriteria::COUNT, 30, 0.5)
 {
     // Load calibration histogram
@@ -192,6 +208,14 @@ Seeker::Seeker(
             _gauss_mean = mean;
             _gauss_std  = std;
             _conf_hist  = confidenceHist(_cal_hist, mean, std);
+            // Wider histogram for CamShift tracking (3σ, not affected by GAUSS_SIGMA)
+            _roi_hist = _cal_hist.clone();
+            float* rp = _roi_hist.ptr<float>(0);
+            for (int i = 0; i < 180; i++) {
+                double d = std::abs(i - mean);
+                d = std::min(d, 180.0 - d);
+                if (d >= 3.0 * std) rp[i] = 0.0f;
+            }
             int kept = cv::countNonZero(_conf_hist);
             printf("[Seeker] Cal hist loaded: mean=%.1f std=%.1f bins=%d/180\n",
                    mean, std, kept);
@@ -206,6 +230,7 @@ Seeker::Seeker(
 
     // Morphological kernels
     _kern3 = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    _kern5 = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
 
     // Hue gate LUT and inRange precomputed bands
     if (_has_cal) {
@@ -235,6 +260,8 @@ Seeker::Seeker(
                 cv::MORPH_CLOSE, CV_8UC1, _kern3);
             _gpu_gauss_bp = cv::cuda::createGaussianFilter(
                 CV_8UC1, CV_8UC1, cv::Size(3, 3), 0);
+            _gpu_dilate_bp = cv::cuda::createMorphologyFilter(
+                cv::MORPH_DILATE, CV_8UC1, _kern5);
         }
     }
 #endif
@@ -512,7 +539,8 @@ cv::Mat Seeker::_detectionMask(const cv::Mat& hsv, bool locked)
             cv::threshold(votes, mask, 1, 255, cv::THRESH_BINARY);
         }
     }
-    cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, _kern3);
+    cv::morphologyEx(mask, mask, cv::MORPH_OPEN,   _kern5);
+    cv::morphologyEx(mask, mask, cv::MORPH_DILATE, _kern5);
     return mask;
 }
 
@@ -585,6 +613,9 @@ void Seeker::resetTracker()
     _win_h_ema     = 0.0;
     _kf_initialized= false;
     _miss_count    = 0;
+#ifdef DRONE_USE_TRACKING
+    _tracker.reset();
+#endif
 }
 
 // ── error_xy ─────────────────────────────────────────────────────────────────
@@ -686,6 +717,12 @@ std::pair<int,int> Seeker::track(cv::Mat& frame)
                 _win_w_ema = _track_win.width;
                 _win_h_ema = _track_win.height;
             }
+#ifdef DRONE_USE_TRACKING
+            if (!_tracker_name.empty() && _detect_count == 3) {
+                _tracker = _makeTracker(_tracker_name);
+                _tracker->init(frame, _track_win);
+            }
+#endif
         } else {
             _detect_count = 0;
             _track_win    = {};
@@ -702,21 +739,88 @@ std::pair<int,int> Seeker::track(cv::Mat& frame)
     }
 
     // ── CamShift step ─────────────────────────────────────────────────────────
-    double now_t  = mono_s();
-    double kf_dt  = _kf_initialized ? std::min(now_t - _kf_last_t, 0.5) : 0.0;
-    _kf_last_t = now_t;
+    double kf_dt = 0.0;
+    if (_use_kalman) {
+        double now_t = mono_s();
+        kf_dt = _kf_initialized ? std::min(now_t - _kf_last_t, 0.5) : 0.0;
+        _kf_last_t = now_t;
+    }
 
-    // Back-project on H channel using confidence histogram
+#ifdef DRONE_USE_TRACKING
+    if (!_tracker_name.empty() && _tracker) {
+        cv::Rect bbox(_track_win);
+        bool ok = _tracker->update(frame, bbox);
+        if (!ok || bbox.width < 4 || bbox.height < 4) {
+            resetTracker();
+            _drawCenterCross(frame, w_frame, h_frame);
+            _updateHistogramWindow();
+            return {-1, -1};
+        }
+        // Clamp bbox to frame
+        bbox.x = std::max(0, std::min(bbox.x, w_frame - 1));
+        bbox.y = std::max(0, std::min(bbox.y, h_frame - 1));
+        bbox.width  = std::min(bbox.width,  w_frame - bbox.x);
+        bbox.height = std::min(bbox.height, h_frame - bbox.y);
+        // Color validation: confirm the ROI still contains target pixels
+        cv::Mat roi_mask = _detectionMask(hsv(bbox), /*locked=*/true);
+        if (cv::countNonZero(roi_mask) < (int)MIN_BLOB_AREA) {
+            _miss_count++;
+            if (_miss_count >= KF_MISS_MAX) resetTracker();
+            _drawCenterCross(frame, w_frame, h_frame);
+            _updateHistogramWindow();
+            return {-1, -1};
+        }
+        _miss_count = 0;
+        _track_win = bbox;
+        _win_w_ema = EMA_ALPHA * _track_win.width  + (1 - EMA_ALPHA) * _win_w_ema;
+        _win_h_ema = EMA_ALPHA * _track_win.height + (1 - EMA_ALPHA) * _win_h_ema;
+        double raw_cx = _track_win.x + _track_win.width  / 2.0;
+        double raw_cy = _track_win.y + _track_win.height / 2.0;
+        int cx, cy;
+        if (_use_kalman) {
+            _miss_count = 0;
+            if (!_kf_initialized) {
+                _kf_x = {raw_cx, 0.0, 1.0, 0.0, 0.0, 1.0};
+                _kf_y = {raw_cy, 0.0, 1.0, 0.0, 0.0, 1.0};
+                _kf_initialized = true;
+                cx = (int)std::round(raw_cx);
+                cy = (int)std::round(raw_cy);
+            } else {
+                _kf_x = kf1dUpdate(_kf_x, raw_cx, kf_dt);
+                _kf_y = kf1dUpdate(_kf_y, raw_cy, kf_dt);
+                cx = (int)std::round(_kf_x.x0);
+                cy = (int)std::round(_kf_y.x0);
+            }
+        } else {
+            cx = (int)std::round(raw_cx);
+            cy = (int)std::round(raw_cy);
+        }
+        cx = std::max(0, std::min(cx, w_frame - 1));
+        cy = std::max(0, std::min(cy, h_frame - 1));
+        auto [ex, ey] = errorXY(cx, cy, w_frame, h_frame);
+        bool centred = std::abs(ex) < CENTER_THRESHOLD && std::abs(ey) < CENTER_THRESHOLD;
+        cv::Scalar box_col = centred ? cv::Scalar(0,233,0) : cv::Scalar(203,192,233);
+        cv::rectangle(frame, _track_win, box_col, 2);
+        cv::line(frame, {0, cy}, {w_frame, cy}, {0,233,233}, 1);
+        cv::line(frame, {cx, 0}, {cx, h_frame}, {0,233,233}, 1);
+        cv::circle(frame, {cx, cy}, 3, {0,233,233}, -1);
+        _drawCenterCross(frame, w_frame, h_frame);
+        _updateHistogramWindow();
+        return {cx, cy};
+    }
+#endif
+
+    // Back-project on H channel using full histogram (more signal for CamShift)
     cv::Mat back_proj;
     {
         int   ch[]  = {0};
         float rng[] = {0, 180};
         const float* ranges[] = {rng};
-        cv::calcBackProject(&hsv, 1, ch, _conf_hist, back_proj, ranges);
+        cv::calcBackProject(&hsv, 1, ch, _cal_hist, back_proj, ranges);
     }
 
-    // Pre-translate search window by predicted velocity
-    if (_kf_initialized && kf_dt > 0.0) {
+    // Pre-translate search window by predicted velocity (Kalman only)
+    if (_use_kalman && _kf_initialized && kf_dt > 0.0) {
         int dx = (int)std::round(_kf_x.x1 * kf_dt);
         int dy = (int)std::round(_kf_y.x1 * kf_dt);
         _track_win.x = std::max(0, std::min(_track_win.x + dx, w_frame - _track_win.width));
@@ -740,13 +844,22 @@ std::pair<int,int> Seeker::track(cv::Mat& frame)
     if (_use_gpu) {
         _gpu_bp_d.upload(back_proj);
         _gpu_gauss_bp->apply(_gpu_bp_d, _gpu_bp_d);
+        _gpu_dilate_bp->apply(_gpu_bp_d, _gpu_bp_d);
         _gpu_bp_d.download(back_proj);
-    } else
+    } else {
 #endif
     cv::GaussianBlur(back_proj, back_proj, cv::Size(3, 3), 0);
+    cv::dilate(back_proj, back_proj, _kern5);
+#ifdef DRONE_USE_CUDA
+    }
+#endif
 
     cv::RotatedRect ret;
-    ret = cv::CamShift(back_proj, _track_win, _term_crit);
+    bool use_meanshift = (_shift_algo == "meanshift");
+    if (use_meanshift)
+        cv::meanShift(back_proj, _track_win, _term_crit);
+    else
+        ret = cv::CamShift(back_proj, _track_win, _term_crit);
 
     // Clamp window
     _track_win.x      = std::max(0, std::min(_track_win.x, w_frame - 1));
@@ -766,7 +879,7 @@ std::pair<int,int> Seeker::track(cv::Mat& frame)
     }
 
     if (camshift_bad) {
-        if (_kf_initialized && _miss_count < KF_MISS_MAX) {
+        if (_use_kalman && _kf_initialized && _miss_count < KF_MISS_MAX) {
             _miss_count++;
             double pred_dt = std::max(kf_dt, 1.0 / 30.0);
             _kf_x = kf1dPredict(_kf_x, pred_dt);
@@ -795,10 +908,16 @@ std::pair<int,int> Seeker::track(cv::Mat& frame)
     _win_w_ema = EMA_ALPHA * _track_win.width  + (1 - EMA_ALPHA) * _win_w_ema;
     _win_h_ema = EMA_ALPHA * _track_win.height + (1 - EMA_ALPHA) * _win_h_ema;
 
-    // Snap: if blob disagrees with CamShift centre, snap to blob
+    // Snap: if blob disagrees with tracker centre, snap to blob
+    double shift_cx = use_meanshift
+        ? (_track_win.x + _track_win.width  / 2.0)
+        : (double)ret.center.x;
+    double shift_cy = use_meanshift
+        ? (_track_win.y + _track_win.height / 2.0)
+        : (double)ret.center.y;
     if (blob) {
-        int cs_cx = (int)ret.center.x;
-        int cs_cy = (int)ret.center.y;
+        int cs_cx = (int)shift_cx;
+        int cs_cy = (int)shift_cy;
         int b_cx  = blob->x + blob->width  / 2;
         int b_cy  = blob->y + blob->height / 2;
         double dist = std::hypot(cs_cx - b_cx, cs_cy - b_cy);
@@ -812,23 +931,27 @@ std::pair<int,int> Seeker::track(cv::Mat& frame)
         }
     }
 
-    double raw_cx = ret.center.x;
-    double raw_cy = ret.center.y;
-    _miss_count = 0;
+    double raw_cx = shift_cx;
+    double raw_cy = shift_cy;
 
-    // Kalman update
     int cx, cy;
-    if (!_kf_initialized) {
-        _kf_x = {raw_cx, 0.0, 1.0, 0.0, 0.0, 1.0};
-        _kf_y = {raw_cy, 0.0, 1.0, 0.0, 0.0, 1.0};
-        _kf_initialized = true;
+    if (_use_kalman) {
+        _miss_count = 0;
+        if (!_kf_initialized) {
+            _kf_x = {raw_cx, 0.0, 1.0, 0.0, 0.0, 1.0};
+            _kf_y = {raw_cy, 0.0, 1.0, 0.0, 0.0, 1.0};
+            _kf_initialized = true;
+            cx = (int)std::round(raw_cx);
+            cy = (int)std::round(raw_cy);
+        } else {
+            _kf_x = kf1dUpdate(_kf_x, raw_cx, kf_dt);
+            _kf_y = kf1dUpdate(_kf_y, raw_cy, kf_dt);
+            cx = (int)std::round(_kf_x.x0);
+            cy = (int)std::round(_kf_y.x0);
+        }
+    } else {
         cx = (int)std::round(raw_cx);
         cy = (int)std::round(raw_cy);
-    } else {
-        _kf_x = kf1dUpdate(_kf_x, raw_cx, kf_dt);
-        _kf_y = kf1dUpdate(_kf_y, raw_cy, kf_dt);
-        cx = (int)std::round(_kf_x.x0);
-        cy = (int)std::round(_kf_y.x0);
     }
     cx = std::max(0, std::min(cx, w_frame - 1));
     cy = std::max(0, std::min(cy, h_frame - 1));
@@ -838,11 +961,15 @@ std::pair<int,int> Seeker::track(cv::Mat& frame)
     bool centred = std::abs(ex) < CENTER_THRESHOLD && std::abs(ey) < CENTER_THRESHOLD;
     cv::Scalar box_col = centred ? cv::Scalar(0,233,0) : cv::Scalar(203,192,233);
 
-    cv::Point2f pts[4];
-    ret.points(pts);
-    std::vector<cv::Point> poly;
-    for (auto& p : pts) poly.push_back({(int)p.x, (int)p.y});
-    cv::polylines(frame, poly, true, box_col, 2);
+    if (use_meanshift) {
+        cv::rectangle(frame, _track_win, box_col, 2);
+    } else {
+        cv::Point2f pts[4];
+        ret.points(pts);
+        std::vector<cv::Point> poly;
+        for (auto& p : pts) poly.push_back({(int)p.x, (int)p.y});
+        cv::polylines(frame, poly, true, box_col, 2);
+    }
 
     cv::line(frame, {0, cy}, {w_frame, cy}, {0,233,233}, 1);
     cv::line(frame, {cx, 0}, {cx, h_frame}, {0,233,233}, 1);

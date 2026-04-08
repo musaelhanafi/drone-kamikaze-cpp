@@ -3,8 +3,60 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <string>
 #include <stdexcept>
+
+// ── Tracker option parser ─────────────────────────────────────────────────────
+// Parses a comma-separated string into cfg.use_camshift / use_kalman / tracker.
+// Valid tokens: camshift  meanshift  kalman  mil
+// Default: "camshift,kalman"
+static void parseTrackerOpt(const std::string& val, SeekerCtrlConfig& cfg)
+{
+    cfg.use_camshift = false;
+    cfg.use_kalman   = false;
+    cfg.tracker      = "";
+
+    std::string s = val;
+    while (!s.empty()) {
+        auto pos = s.find(',');
+        std::string tok = (pos == std::string::npos) ? s : s.substr(0, pos);
+        s = (pos == std::string::npos) ? "" : s.substr(pos + 1);
+        // trim whitespace
+        while (!tok.empty() && tok.front() == ' ') tok.erase(0, 1);
+        while (!tok.empty() && tok.back()  == ' ') tok.pop_back();
+        // lowercase
+        for (auto& c : tok) c = (char)std::tolower((unsigned char)c);
+        if (tok.empty()) continue;
+
+        if (tok == "camshift" || tok == "meanshift") {
+            if (cfg.use_camshift && cfg.shift_algo != tok) {
+                fprintf(stderr,
+                    "error: --tracker: cannot combine 'camshift' and 'meanshift'\n");
+                std::exit(1);
+            }
+            cfg.use_camshift = true;
+            cfg.shift_algo   = tok;
+        } else if (tok == "kalman") {
+            cfg.use_kalman = true;
+        } else if (tok == "mil") {
+            cfg.tracker = tok;
+        } else {
+            fprintf(stderr,
+                "error: --tracker: unknown token '%s'.\n"
+                "  Valid: camshift, meanshift, kalman, mil\n",
+                tok.c_str());
+            std::exit(1);
+        }
+    }
+
+    if (!cfg.tracker.empty() && cfg.use_camshift) {
+        fprintf(stderr,
+            "error: --tracker: cannot combine '%s' with 'camshift' — "
+            "they are mutually exclusive\n", cfg.tracker.c_str());
+        std::exit(1);
+    }
+}
 
 // ── Minimal argument parser ───────────────────────────────────────────────────
 
@@ -21,7 +73,10 @@ static void usage(const char* prog)
         "  --mask-algo ALGO     gaussian|adaptive|inrange|all (default: all)\n"
         "  --histogram          Show calibration histogram window\n"
         "  --mask               Show detection mask window\n"
-        "  --no-camshift        Use blob centroid directly (disable CamShift)\n"
+        "  --tracker TOKENS     Comma-separated tracking components\n"
+        "                         (default: camshift,kalman)\n"
+        "                         Tokens: camshift meanshift kalman mil csrt dasiamrpn nano vit\n"
+        "                         Examples: meanshift,kalman  mil  mil,kalman\n"
         "  --no-box-filter      Accept any blob shape\n"
         "  --no-prediction      Disable PN lead input prediction\n"
         "  --no-hud-pitch       Disable pitch ladder in HUD\n"
@@ -75,8 +130,8 @@ int main(int argc, char* argv[])
             cfg.show_histogram = true;
         } else if (std::strcmp(a, "--mask") == 0) {
             cfg.show_mask = true;
-        } else if (std::strcmp(a, "--no-camshift") == 0) {
-            cfg.use_camshift = false;
+        } else if (std::strcmp(a, "--tracker") == 0 && i+1 < argc) {
+            parseTrackerOpt(argv[++i], cfg);
         } else if (std::strcmp(a, "--no-box-filter") == 0) {
             cfg.box_filter = false;
         } else if (std::strcmp(a, "--no-prediction") == 0) {

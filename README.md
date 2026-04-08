@@ -132,7 +132,10 @@ The project expects the `mavlink/c_library_v2` header-only library inside `mavli
 
 ```bash
 git clone --depth=1 https://github.com/mavlink/c_library_v2.git mavlink
+git apply mavlink_patch/tracking_message.patch --directory=mavlink
 ```
+
+The patch adds `TRACKING_MESSAGE` (ID 11045) — the custom MAVLink message used to send normalised tracking errors to ArduPlane. It modifies one file (`ardupilotmega/ardupilotmega.h`) and adds one new header (`ardupilotmega/mavlink_msg_tracking_message.h`).
 
 > **Dialect:** the code includes `<ardupilotmega/mavlink.h>`, which is present in `c_library_v2/ardupilotmega/`.
 
@@ -169,14 +172,28 @@ Build produces two binaries inside `build/`:
 Run `calibrate_color` with your camera pointed at the target:
 
 ```bash
-./build/calibrate_color 0          # camera index 0
-./build/calibrate_color video.mp4  # or a video file
+./build/calibrate_color --source 0                          # camera index 0
+./build/calibrate_color --source video.mp4                  # video file
+./build/calibrate_color --source 0 --mask all               # show detection mask
+./build/calibrate_color --source 0 --mask inrange           # specific algorithm
 ```
 
-1. Drag a rectangle over the pink target to sample its hue.
-2. Repeat on several frames to build up a robust histogram.
-3. Press **`s`** to save `color_histogram.txt` in the current directory.
-4. Press **`r`** to reset the sample if needed, **`q`** to quit.
+### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `--source STR` | `0` | Camera index or video file path |
+| `--output FILE` | `color_histogram.txt` | Histogram output file |
+| `--mask ALGO` | off | Show detection mask window. ALGO: `gaussian` \| `adaptive` \| `inrange` \| `all` |
+
+### Workflow
+
+1. Point the camera at the target.  If a histogram file already exists it is loaded automatically and the mask window shows live detection immediately.
+2. Drag a rectangle over the pink target **or press `d`** to open the selection tool — only saturated/bright pixels are counted, background is ignored.
+3. Repeat on several frames to build a robust histogram.
+4. Watch the mask window (if `--mask` is given) to confirm the detection looks correct.
+5. Press **`s`** to save `color_histogram.txt` in the current directory.
+6. Press **`r`** to reset all samples if needed, **`q`** to quit.
 
 `color_histogram.txt` must be present in the working directory when `drone_seeker` runs.
 

@@ -114,5 +114,5 @@ namespace MsgId {
     constexpr uint32_t HOME_POSITION        = MAVLINK_MSG_ID_HOME_POSITION;
     constexpr uint32_t PARAM_VALUE          = MAVLINK_MSG_ID_PARAM_VALUE;
     constexpr uint32_t PID_TUNING           = MAVLINK_MSG_ID_PID_TUNING;
-    constexpr uint32_t DEBUG_VECT           = MAVLINK_MSG_ID_DEBUG_VECT;
+    constexpr uint32_t TRACKING_MESSAGE     = MAVLINK_MSG_ID_TRACKING_MESSAGE;
 }
